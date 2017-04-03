@@ -6,7 +6,7 @@
 
 	The MIT License (MIT)
 
-	Copyright (c) 2016 Joey Albert Abano		
+	Copyright (c) 2015-2017 Joey Albert Abano		
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -61,6 +61,24 @@
 	archives\<year-month>\index.html -- list of blogs in that year-month
 	archives\<year-month>\<segment>-id\index.html
 	photo\<uploaddttm>\<IMG_,THB_,WEB_><filename>.JPG
+
+	
+	Future Changes
+	i. bug: update deploy and template content upon changing database
+	ii. improvmement: change the paging from old contents should have the lower integer, this is helpful for google search permlinks
+	iii. improvement: add {{blog.topic.next}} and {{blog.topic.previous}} reference to show the next and previous blogs within pages
+	iv. improvement: photo full reference with url
+	v. enhancement: dead link checker
+
+
+	1. Batch blog generation. Currently blogs are generated in one go, if the blog post exceed threshold
+	  it will throw memory issues.
+	2. Archive, versioning section
+	3. Preview, can be generated when writing the blog
+	4. Next and Previous blog post within the blog view
+	. Plugin features, external include of PSTAHL 
+	- Google search bar {{google.custom.searchbar}}
+	- Facebook comment area {{facebook.comment}}
 */
 
 
@@ -835,10 +853,27 @@ class Helper {
 	 *	- Clears extra spaces, breaks and carriage returns. 
 	 *	- Convert double space to single space.
 	 *	- Remove space at start and end tag
+	 *  - Prevent extra space clearing for anchor and span tags
 	 */	
 	function removeExtraSpaces( $str="" ) {
 		$s = preg_replace(array('/\s{2,}/','/[\t\n]/'),' ',$str);
+		$s = $this->spaceTildeSwap($s, array(' <a',' <span',' <b',' <strong',' <i','a> ','span> ','b> ','strong> ','i> '));
 		$s = str_replace('> ','>',$s); $s = str_replace(' <','<',$s);
+		$s = $this->tildeSpaceSwap($s, array('~<a','~<span','~<b','~<strong','~<i','a>~','span>~','b>~','strong>~','i>~'));
+		return $s;
+	}
+
+	function spaceTildeSwap($s, $ar) {
+		for($i=0;$i<count($ar);$i++) {
+			$s = str_replace($ar[$i], str_replace(' ','~',$ar[$i]) ,$s);
+		}
+		return $s;
+	}
+
+	function tildeSpaceSwap($s, $ar) {
+		for($i=0;$i<count($ar);$i++) {
+			$s = str_replace($ar[$i], str_replace('~',' ',$ar[$i]) ,$s);
+		}
 		return $s;
 	}
 
@@ -989,7 +1024,7 @@ class BlogService extends BaseService {
 		$this->post['preview'] = $this->blog['CONTENT_SUMMARY'];
 	}
 
-	public function hasRequired() {
+	public function hasRequired($ar = array()) {
 		return parent::hasRequired( array('title','tags','publishdate','status','preview','content') );		
 	}
 
@@ -1418,8 +1453,8 @@ class DeployService extends BaseService {
 			$this->db->savePstahl(array('NAME'=>'EXPORT_RUNNING','VALUE'=>'Y'));
 
 			// Run the process in the background. recommended that it is shot at an ajax request. check the status based on the db
-			// ignore_user_abort(true); 
-			// set_time_limit(0);			
+			ignore_user_abort(true); 
+			set_time_limit(0);			
 
 			// retrieve page template
 			$result = $this->db->getPstahl(array('NAME'=>'PAGE_TEMPLATE'));
@@ -1465,27 +1500,73 @@ class DeployService extends BaseService {
 			$count = 1; $curpage = 1;
 			$archive_indexes = array();
 			$pages_indexes = array();
+			$resultarray = array();
+
 			while($row = $result->fetchArray(SQLITE3_ASSOC) ) {
+				array_push($resultarray, $row);
+			}
+
+			foreach ($resultarray as $rowkey => $row) {
 				// identify publish datetime, segment sufix
 				list($YEAR, $MONTH, $DAY) = explode('-',explode(' ', $row['PUBLISH_DTTM'])[0]) ;
 				$PUBLISHDTTM_TOTIME = strtotime("$MONTH/$DAY/$YEAR");
 				$SEGMENT_SUFIX = $row['SEGMENT'] . "-" . substr(filter_var($row['BLOG_ID'], FILTER_SANITIZE_NUMBER_INT), 0, 6); 
 				$SUMMARY_CONTENT = $row['CONTENT_SUMMARY'];
-				// $SUMMARY_CONTENT = map_photo($SUMMARY_CONTENT,$_BASE_PATH,$_BASE_URL);
 				$SUMMARY_CONTENT = $photoService->replacePhotoCode($SUMMARY_CONTENT);
 
 				// generate directories and file on each segment			
 				$SEGMENT_PATH = $config['ARCHIVEPATH']."$YEAR/$MONTH/" . $SEGMENT_SUFIX . "/";
 				$SEGMENT_URL = $config['ARCHIVEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX . "/";
 				$BLOG_PATH = $config['BASEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX . "/";
-				$SEGMENT_CONTENT = "<h2>".$row['TITLE']."</h2><p class=\"ui-published-date\">".date("l \of F d, Y", $PUBLISHDTTM_TOTIME)."</p><article class=\"ui-content\">".$row['CONTENT']."</article>";
+				$SEGMENT_CONTENT = "<h1>".$row['TITLE']."</h1><p class=\"ui-published-date\">".date("l \of F d, Y", $PUBLISHDTTM_TOTIME)."</p><article class=\"ui-content\">".$row['CONTENT']."</article>";
 				$this->generateDirectory($SEGMENT_PATH);
 
 				$SEGMENT_CONTENT = str_replace("{{html.content}}",$SEGMENT_CONTENT,$tpl);
 				$SEGMENT_CONTENT = str_replace("{{html.title}}"," | Archives | ". strtolower($row['TITLE']),$SEGMENT_CONTENT);
 				$SEGMENT_CONTENT = str_replace("{{url.current}}",$SEGMENT_URL,$SEGMENT_CONTENT);
-				//$SEGMENT_CONTENT = map_photo($SEGMENT_CONTENT,$_BASE_PATH,$_BASE_URL);
 				$SEGMENT_CONTENT = $photoService->replacePhotoCode($SEGMENT_CONTENT);
+
+				// begin: get next and previous content
+				$prevblog = ""; $nextblog = ""; $prevbloglink = ""; $nextbloglink = "";
+				if( $count == 1 && $config['BLOGTOTALCOUNT']>1 ) {
+					$prev_index = $count;
+					$SEGMENT_SUFIX2 = $resultarray[$prev_index]['SEGMENT'] . "-" . substr(filter_var($resultarray[$prev_index]['BLOG_ID'], FILTER_SANITIZE_NUMBER_INT), 0, 6); 
+					$SEGMENT_URL2 = $config['ARCHIVEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX2 . "/";
+					$prevblog = "<a href=\"$SEGMENT_URL2\" class=\"ui-prev-blog\">" . $resultarray[$prev_index]['TITLE'] . "</a>";
+					$prevbloglink = $SEGMENT_URL2;
+				}
+				else if( $count == $config['BLOGTOTALCOUNT'] && $config['BLOGTOTALCOUNT']>1 ) {
+					$next_index = $count-2;
+					$SEGMENT_SUFIX3 = $resultarray[$next_index]['SEGMENT'] . "-" . substr(filter_var($resultarray[$next_index]['BLOG_ID'], FILTER_SANITIZE_NUMBER_INT), 0, 6); 
+					$SEGMENT_URL3 = $config['ARCHIVEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX3 . "/";
+					$nextblog = "<a href=\"$SEGMENT_URL3\" class=\"ui-next-blog\">" . $resultarray[$next_index]['TITLE'] . "</a>";					
+					$nextbloglink = $SEGMENT_URL3;
+				}
+				else if( $count > 1 && $config['BLOGTOTALCOUNT']>2 ){
+					$prev_index = $count;					
+					$SEGMENT_SUFIX2 = $resultarray[$prev_index]['SEGMENT'] . "-" . substr(filter_var($resultarray[$prev_index]['BLOG_ID'], FILTER_SANITIZE_NUMBER_INT), 0, 6); 
+					$SEGMENT_URL2 = $config['ARCHIVEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX2 . "/";
+					$prevblog = "<a href=\"$SEGMENT_URL2\" class=\"ui-prev-blog\">" . $resultarray[$prev_index]['TITLE'] . "</a>";
+					$prevbloglink = $SEGMENT_URL2;
+					
+					$next_index = $count-2;
+					$SEGMENT_SUFIX3 = $resultarray[$next_index]['SEGMENT'] . "-" . substr(filter_var($resultarray[$next_index]['BLOG_ID'], FILTER_SANITIZE_NUMBER_INT), 0, 6); 
+					$SEGMENT_URL3 = $config['ARCHIVEURL']."$YEAR/$MONTH/" . $SEGMENT_SUFIX3 . "/";
+					$nextblog = "<a href=\"$SEGMENT_URL3\" class=\"ui-next-blog\">" . $resultarray[$next_index]['TITLE'] . "</a>";
+					$nextbloglink = $SEGMENT_URL3;
+				}
+				$SEGMENT_CONTENT = str_replace("{{url.prevblog}}",$prevblog,$SEGMENT_CONTENT);
+				$SEGMENT_CONTENT = str_replace("{{url.nextblog}}",$nextblog,$SEGMENT_CONTENT);
+				$SEGMENT_CONTENT = str_replace("{{url.prevblog.link}}",$prevbloglink,$SEGMENT_CONTENT);
+				$SEGMENT_CONTENT = str_replace("{{url.nextblog.link}}",$nextbloglink,$SEGMENT_CONTENT);
+				// end: get next and previous content
+
+				// begin: custom templating
+				$SEGMENT_CONTENT = str_replace("{{html.blog.title}}",$row['TITLE'],$SEGMENT_CONTENT);
+				$SEGMENT_CONTENT = str_replace("{{html.blog.content}}",$row['CONTENT'],$SEGMENT_CONTENT);
+				$SEGMENT_CONTENT = str_replace("{{html.blog.publishdate}}",date("l \of F d, Y", $PUBLISHDTTM_TOTIME),$SEGMENT_CONTENT);
+				// end: custom templating
+
 
 				$this->generateIndexFile($SEGMENT_PATH, $this->cleanUnusedCodes($config, $SEGMENT_CONTENT));
 
@@ -1511,8 +1592,9 @@ class DeployService extends BaseService {
 
 			// 2.4 populate the archive indexes
 			foreach ($archive_indexes as $KEY => $INDEX_CONTENT) {
-				$INDEX_CONTENT = "<h1>Archives</h1><ul class=\"ui-archive-list\">".$INDEX_CONTENT."</ul>";
+				$INDEX_CONTENT = "<h1 class=\"archives\">Archives</h1><ul class=\"ui-archive-list\">".$INDEX_CONTENT."</ul>";
 				$INDEX_CONTENT = str_replace("{{html.content}}", $INDEX_CONTENT, $tpl) ;
+				$INDEX_CONTENT = $photoService->replacePhotoCode($INDEX_CONTENT);
 				$this->generateIndexFile($KEY, $this->cleanUnusedCodes($config, $INDEX_CONTENT));
 			}
 
@@ -1532,19 +1614,19 @@ class DeployService extends BaseService {
 				}				
 
 				$PAGES_QUICK = "";
-				if($KEY==1 && $config['BLOGTOTALPAGES']>1) {
-					$PAGES_QUICK = "<div class=\"ui-older\"><span><a href=\"".$config['PAGESURL']."2/\">Older &gt;&gt;&gt;</a></span></div>";
+				if($KEY==1 && $config['BLOGTOTALPAGES']>1) {					
+					$PAGES_QUICK = "<div class=\"ui-older pull-right\"><span><a href=\"".$config['PAGESURL']. ($config['BLOGTOTALPAGES']-1) . "/\">Older &gt;&gt;&gt;</a></span></div>";
 				}
 				else if($KEY!=1 && $config['BLOGTOTALPAGES']>1 && $KEY!=$config['BLOGTOTALPAGES']) {
-					$PAGES_QUICK = "<div class=\"ui-older\"><span><a href=\"".$config['PAGESURL']. ($KEY+1) . "/\">Older &gt;&gt;&gt;</a></span></div>" .
-					"<div class=\"ui-newer\"><span><a href=\"".$config['PAGESURL']. ($KEY-1) . "/\">Newer &lt;&lt;&lt;</a></span></div>";					
+					$PAGES_QUICK = "<div class=\"ui-older pull-right\"><span><a href=\"".$config['PAGESURL']. ($config['BLOGTOTALPAGES']-$KEY+1-1) . "/\">Older &gt;&gt;&gt;</a></span></div>" .
+					"<div class=\"ui-newer pull-left\"><span><a href=\"".$config['PAGESURL']. ($config['BLOGTOTALPAGES']-$KEY+1+1) . "/\">Newer &lt;&lt;&lt;</a></span></div>";					
 				}
 				else if($KEY==$config['BLOGTOTALPAGES'] && $config['BLOGTOTALPAGES']>1) {
-					$PAGES_QUICK = "<div><span><a href=\"".$config['PAGESURL']. ($config['BLOGTOTALPAGES']-1) . "/\">Newer &lt;&lt;&lt;</a></span></div>";	
+					$PAGES_QUICK = "<div class=\"ui-newer pull-left\"><span><a href=\"".$config['PAGESURL']."2/\">Newer &lt;&lt;&lt;</a></span></div>";
 				}
 
 				if( $PAGES_QUICK!="" ) {
-					$PAGES_QUICK = "<div>" . $PAGES_QUICK . "</div>";
+					$PAGES_QUICK = "<div class=\"clearfix\">" . $PAGES_QUICK . "</div>";
 					if( $_USE_PAGEQUICK ) {
 						$PAGES = $PAGES . $PAGES_QUICK;	
 					}				
@@ -1553,21 +1635,21 @@ class DeployService extends BaseService {
 				$INDEX_CONTENT = $INDEX_CONTENT . $PAGES;
 
 				$INDEX_CONTENT = str_replace("{{html.content}}",$INDEX_CONTENT,$tpl);
-				$this->generateIndexFile($config['PAGESPATH'].$KEY."/", $this->cleanUnusedCodes($config, $INDEX_CONTENT));
+				$INDEX_CONTENT = $photoService->replacePhotoCode($INDEX_CONTENT);
+				$this->generateIndexFile($config['PAGESPATH'].($config['BLOGTOTALPAGES']-$KEY+1)."/", $this->cleanUnusedCodes($config, $INDEX_CONTENT));				
 			}		
-			copy($config['PAGESPATH']."1/index.html",$config['BASEPATH']."index.html");
-			copy($config['PAGESPATH']."1/index.html",$config['PAGESPATH']."index.html");
+			copy($config['PAGESPATH'].$config['BLOGTOTALPAGES']."/index.html",$config['BASEPATH']."index.html");
+			copy($config['PAGESPATH'].$config['BLOGTOTALPAGES']."/index.html",$config['PAGESPATH']."index.html");
 
 			//-------------------------------
 			// 2.6 generate pages content
 			$sql = 'SELECT BLOG_ID,TITLE,SEGMENT,PUBLISH_DTTM,CONTENT,CONTENT_PATH FROM BLOG WHERE STATUS="P" AND CONTENT_TYPE="P" ORDER BY DATETIME(PUBLISH_DTTM) DESC';
 			$result = $this->db->query($sql);
 			while($row = $result->fetchArray(SQLITE3_ASSOC) ) {
-				$SEGMENT_CONTENT = "<h2>".$row['TITLE']."</h2><p>".$row['CONTENT']."</p>";
+				$SEGMENT_CONTENT = "<h1>".$row['TITLE']."</h1><p>".$row['CONTENT']."</p>";
 				$SEGMENT_CONTENT = str_replace("{{html.content}}",$SEGMENT_CONTENT,$tpl);
 				$SEGMENT_CONTENT = str_replace("{{html.title}}"," | ". strtolower($row['TITLE']),$SEGMENT_CONTENT);
 				$SEGMENT_CONTENT = str_replace("{{url.current}}",$SEGMENT_URL,$SEGMENT_CONTENT);
-				// $SEGMENT_CONTENT = map_photo($SEGMENT_CONTENT,$_BASE_PATH,$_BASE_URL);
 				$SEGMENT_CONTENT = $photoService->replacePhotoCode($SEGMENT_CONTENT);
  
 				$this->generateIndexFile($config['BASEPATH'].$this->helper->cleanPath( trim($row['CONTENT_PATH'],'/') ),$this->cleanUnusedCodes($config, $SEGMENT_CONTENT));
@@ -1603,6 +1685,7 @@ class DeployService extends BaseService {
 		$content = str_replace("{{url.base}}",$this->getset($config,'BASEURL'),$content);
 		$content = str_replace("{{url.archive}}",$this->getset($config,'ARCHIVEURL'),$content);
 		$content = str_replace("{{url.pages}}",$this->getset($config,'PAGESURL'),$content);
+		$content = str_replace("{{html.title}}","",$content);
 		return $content;
 	}
 
@@ -1944,7 +2027,7 @@ $(function(){
 		if(form){
 			form = $(form);
 			switch(form.attr('name')) {
-				case 'database-select': blog.list(); pages.list(); photo.list(); templates.list(); break;
+				case 'database-select': blog.list(); pages.list(); photo.list(); templates.list(); deploy.list();break;
 				case 'blog-create': blog.list(); break;
 				case 'pages-create': pages.list(); break;
 				case 'photo-upload': photo.list(); break;
@@ -2052,12 +2135,12 @@ Blog.prototype.list = function(){
 		
 		if(json&&json.table&&json.table.length>0) {
 			var a = json.table;
-			tb.find('thead').empty().append('<tr><th>Title</th><th>Segment</th><th>Publish Status</th><th>Action</th></tr>');
+			tb.find('thead').empty().append('<tr><th>Title</th><th>Segment</th><th>Publish Status</th><th style="width:160px;">Action</th></tr>');
 			tb.find('tbody').empty();
 			for(i=0;i<a.length;i++){
 				var r = a[i];
 				var c = '<td>'+r.TITLE+'</td><td>'+r.SEGMENT+'<br><span class="label label-default">/archive</span></td><td>'+r.PUBLISH_DTTM+'<br>'+(r.STATUS=='P'?'<span class="label label-primary">Published</span>':'<span class="label label-warning">Draft</span>')+'</td>';
-				var b = '<td><a class="btn btn-primary modify" attr-target-id="'+r.ID+'">Modify</a></td>';
+				var b = '<td><a class="btn btn-primary modify" attr-target-id="'+r.ID+'">Modify</a>&nbsp;<a class="btn btn-primary clone" attr-target-id="'+r.ID+'">Clone</a></td>';
 				tb.find('tbody').append('<tr class="'+(r.STATUS=='P'?'':'warning')+'">'+c+b+'</tr>');
 			}						
 		}	
@@ -2079,6 +2162,16 @@ Blog.prototype.buttonEvents = function(o){
 		$('#modal-loading').modal({show:true, keyboard:false, backdrop:'static'});
 		$.post({url:'{{base.url}}', type:'POST', data:'action=blog.create.get&id='+id}).done(function(json){
 			$('a.menu.blog-create').trigger('click');				
+			self.fillform(json);
+			$('#modal-loading').modal('hide');			
+		});	
+	});
+	o.tb.find('a.clone').click(function(){
+		var id = $(this).attr('attr-target-id');
+		$('#modal-loading').modal({show:true, keyboard:false, backdrop:'static'});
+		$.post({url:'{{base.url}}', type:'POST', data:'action=blog.create.get&id='+id}).done(function(json){
+			$('a.menu.blog-create').trigger('click');	
+			json.id='';			
 			self.fillform(json);
 			$('#modal-loading').modal('hide');			
 		});	
@@ -2697,8 +2790,8 @@ EOF;
 				<textarea id="css-common-content-text" name="css-common-content-text" class="hide"></textarea>
 				</div>
 				<div class="form-group guidelines">
-					<p>
-					<code>{{url.base}}</code>&nbsp;<code>{{url.current}}</code>&nbsp;<code>{{url.archive}}</code>&nbsp;<code>{{url.pages}}</code>&nbsp;<code>{{html.content}}</code>&nbsp;<code>{{html.title}&#125;</code>&nbsp;<code>{{common.js}}</code>&nbsp;<code>{{common.css}}</code>
+					<p style="word-wrap: break-word;">
+					<code>{{url.base}}</code>&nbsp; <code>{{url.current}}</code>&nbsp; <code>{{url.archive}}</code>&nbsp; <code>{{url.pages}}</code>&nbsp; <code>{{html.content}}</code>&nbsp; <code>{{html.title}&#125;</code>&nbsp; <code>{{common.js}}</code>&nbsp; <code>{{common.css}}</code>&nbsp; <code>{{url.prevblog}}</code>&nbsp; <code>{{url.nextblog}}</code>&nbsp; <code>{{url.prevblog.link}}</code>&nbsp; <code>{{url.nextblog.link}}</code>&nbsp; <code>{{html.blog.title}}</code>&nbsp; <code>{{html.blog.content}}</code>&nbsp; <code>{{html.blog.publishdate}}</code>			
 					</p>
 					<p>
 					<code>{{photo:int}}</code>&nbsp;
@@ -2746,7 +2839,7 @@ EOF;
 		<!-- .end:deploy -->
 	</div>
 	
-	<iframe name="action-catch" class="action catch hidex"></iframe>
+	<iframe name="action-catch" class="action catch hide"></iframe>
 
 	<!-- Modal Loading -->
 	<div class="modal fade" id="modal-loading" role="dialog">
